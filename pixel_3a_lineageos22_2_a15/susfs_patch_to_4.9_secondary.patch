@@ -139,11 +139,15 @@ index b5edc67..6b8c708 100644
  
  	/* We don't show the stack guard page in /proc/maps */
 diff --git a/fs/stat.c b/fs/stat.c
-index 7bacc58..3c416bf 100644
+index b65c0ab..0c738b4 100644
 --- a/fs/stat.c
 +++ b/fs/stat.c
-@@ -29,6 +29,12 @@ extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+@@ -27,8 +27,16 @@ extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+ extern struct static_key_true ksu_su_compat_enabled;
+ extern bool __ksu_is_allow_uid_for_current(uid_t uid);
  extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
++extern int filename_lookup(int dfd, struct filename *name, unsigned flags,
++			   struct path *path, struct path *root);
  #endif // #ifdef CONFIG_KSU_SUSFS
  
 +#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
@@ -155,7 +159,7 @@ index 7bacc58..3c416bf 100644
  void generic_fillattr(struct inode *inode, struct kstat *stat)
  {
  	stat->dev = inode->i_sb->s_dev;
-@@ -48,11 +54,6 @@ void generic_fillattr(struct inode *inode, struct kstat *stat)
+@@ -48,11 +56,6 @@ void generic_fillattr(struct inode *inode, struct kstat *stat)
  
  EXPORT_SYMBOL(generic_fillattr);
  
@@ -167,16 +171,14 @@ index 7bacc58..3c416bf 100644
  /**
   * vfs_getattr_nosec - getattr without security checks
   * @path: file to get attributes from
-@@ -68,11 +69,33 @@ extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct k
+@@ -68,11 +71,33 @@ extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct k
  int vfs_getattr_nosec(struct path *path, struct kstat *stat)
  {
  	struct inode *inode = d_backing_inode(path->dentry);
 +#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 +	u32 result_mask = 0;
 +	bool is_fuse = false;
- 
--	if (inode->i_op->getattr)
--		return inode->i_op->getattr(path->mnt, path->dentry, stat);
++
 +	if (susfs_is_current_app_uid() &&
 +	    susfs_is_inode_sus_kstat(inode, &is_fuse))
 +		result_mask = is_fuse ? STATX_SUS_KSTAT_FUSE :
@@ -185,7 +187,9 @@ index 7bacc58..3c416bf 100644
 +
 +	if (inode->i_op->getattr) {
 +		int err;
-+
+ 
+-	if (inode->i_op->getattr)
+-		return inode->i_op->getattr(path->mnt, path->dentry, stat);
 +		err = inode->i_op->getattr(path->mnt, path->dentry, stat);
 +#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 +		if (!err && result_mask)
@@ -203,6 +207,25 @@ index 7bacc58..3c416bf 100644
  	return 0;
  }
  
+@@ -114,6 +139,9 @@ int vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat,
+ 	struct path path;
+ 	int error = -EINVAL;
+ 	unsigned int lookup_flags = 0;
++#ifdef CONFIG_KSU_SUSFS
++	struct filename *fname = NULL;
++#endif
+ 
+ 	if ((flag & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+ 		      AT_EMPTY_PATH)) != 0)
+@@ -132,7 +160,7 @@ retry:
+ 
+ 	if (static_branch_likely(&ksu_su_compat_enabled)) {
+ 		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+-			ksu_handle_stat(&dfd, &fname, &flags);
++			ksu_handle_stat(&dfd, &fname, &flag);
+ 	}
+ 
+ orig_flow:
 diff --git a/fs/statfs.c b/fs/statfs.c
 index a2dd028..b28b587 100644
 --- a/fs/statfs.c
