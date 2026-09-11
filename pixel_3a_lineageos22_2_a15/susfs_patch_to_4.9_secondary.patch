@@ -1,0 +1,290 @@
+diff --git a/fs/namei.c b/fs/namei.c
+index 5235abc..e2d289d 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1623,6 +1623,9 @@ retry:
+ 	dentry = lookup_real(base->d_inode, dentry, flags);
+ 
+ 	if (unlikely(dentry) && !IS_ERR(dentry) && dentry->d_inode && !found_sus_path && susfs_is_inode_sus_path(dentry->d_inode)) {
++		bool deny_create = dentry->d_inode->i_sb->s_magic == FUSE_SUPER_MAGIC &&
++			(flags & (LOOKUP_CREATE | LOOKUP_EXCL));
++
+ 		if (d_in_lookup(dentry))
+ 			d_lookup_done(dentry);
+ 		if (!(flags & LOOKUP_RCU))
+@@ -1631,8 +1634,7 @@ retry:
+ 		//   it is trying to find the fuse sus path with the create flag, then
+ 		//   at least we can prevent the fake qstr file from from being created,
+ 		//   although it is futile to do this, it is better than doing nothing.
+-		if (dentry->d_inode->i_sb->s_magic == FUSE_SUPER_MAGIC &&
+-			(flags & (LOOKUP_CREATE | LOOKUP_EXCL)))
++		if (deny_create)
+ 			return ERR_PTR(-EACCES);
+ 		dentry = d_alloc(base, &susfs_fake_qstr_name);
+ 		found_sus_path = true;
+diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
+index 855ddae..be0db27 100644
+--- a/fs/notify/fdinfo.c
++++ b/fs/notify/fdinfo.c
+@@ -134,7 +134,7 @@ static void inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
+ 					goto orig_flow;
+ 				}
+ 				dpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+-				if (!dpath) {
++				if (IS_ERR(dpath)) {
+ 					goto out_kfree;
+ 				}
+ 				if (kern_path(dpath, 0, &path)) {
+diff --git a/fs/proc/cmdline.c b/fs/proc/cmdline.c
+index cbd82df..a58cef8 100644
+--- a/fs/proc/cmdline.c
++++ b/fs/proc/cmdline.c
+@@ -3,8 +3,20 @@
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ 
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;
++extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
++#endif
++
+ static int cmdline_proc_show(struct seq_file *m, void *v)
+ {
++#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
++	if (static_branch_likely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {
++		susfs_spoof_cmdline_or_bootconfig(m);
++		seq_putc(m, '\n');
++		return 0;
++	}
++#endif
+ 	seq_printf(m, "%s\n", saved_command_line);
+ 	return 0;
+ }
+diff --git a/fs/proc/fd.c b/fs/proc/fd.c
+index a835a8b..7b831f5 100644
+--- a/fs/proc/fd.c
++++ b/fs/proc/fd.c
+@@ -92,7 +92,7 @@ static int seq_show(struct seq_file *m, void *v)
+ 				goto orig_flow;
+ 			}
+ 			dpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+-			if (!dpath) {
++			if (IS_ERR(dpath)) {
+ 				goto out_kfree;
+ 			}
+ 			if (kern_path(dpath, 0, &path)) {
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index b5edc67..6b8c708 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -16,6 +16,9 @@
+ #include <linux/page_idle.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/mm_inline.h>
++#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
++#include <linux/susfs_def.h>
++#endif
+ 
+ #include <asm/elf.h>
+ #include <asm/uaccess.h>
+@@ -347,6 +350,7 @@ static void show_vma_header_prefix(struct seq_file *m,
+ }
+ 
+ #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
+ extern void susfs_sus_kstat_spoof_show_map_vma(struct inode *inode, dev_t *out_dev, unsigned long *out_ino);
+ #endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+ #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+@@ -369,9 +373,42 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
+ 
+ 	if (file) {
+ 		struct inode *inode = file_inode(vma->vm_file);
++#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
++		if (SUSFS_IS_INODE_OPEN_REDIRECT(inode)) {
++			char *spoofed_redirected_name = NULL;
++			int srcu_idx = srcu_read_lock(&susfs_srcu_open_redirect);
++			int ret = susfs_open_redirect_spoof_show_map_vma_srcu(inode, &ino, &dev, &spoofed_redirected_name);
++
++			if (!ret) {
++				pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
++				start = vma->vm_start;
++				end = vma->vm_end;
++				show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
++				seq_pad(m, ' ');
++				if (spoofed_redirected_name)
++					seq_puts(m, spoofed_redirected_name);
++				seq_putc(m, '\n');
++				srcu_read_unlock(&susfs_srcu_open_redirect, srcu_idx);
++				return;
++			}
++			srcu_read_unlock(&susfs_srcu_open_redirect, srcu_idx);
++		}
++#endif
++#ifdef CONFIG_KSU_SUSFS_SUS_MAP
++		if (SUSFS_IS_INODE_SUS_MAP(inode))
++			return;
++#endif
+ 		dev = inode->i_sb->s_dev;
+ 		ino = inode->i_ino;
+ 		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++		if (susfs_is_current_app_uid()) {
++			bool is_fuse = false;
++
++			if (susfs_is_inode_sus_kstat(inode, &is_fuse))
++				susfs_sus_kstat_spoof_show_map_vma(inode, &dev, &ino);
++		}
++#endif
+ 	}
+ 
+ 	/* We don't show the stack guard page in /proc/maps */
+diff --git a/fs/stat.c b/fs/stat.c
+index 7bacc58..3c416bf 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -29,6 +29,12 @@ extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+ extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+ #endif // #ifdef CONFIG_KSU_SUSFS
+ 
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
++extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode,
++		struct kstat *stat, u32 result_mask);
++#endif
++
+ void generic_fillattr(struct inode *inode, struct kstat *stat)
+ {
+ 	stat->dev = inode->i_sb->s_dev;
+@@ -48,11 +54,6 @@ void generic_fillattr(struct inode *inode, struct kstat *stat)
+ 
+ EXPORT_SYMBOL(generic_fillattr);
+ 
+-#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+-extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
+-extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat, u32 result_mask);
+-#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+-
+ /**
+  * vfs_getattr_nosec - getattr without security checks
+  * @path: file to get attributes from
+@@ -68,11 +69,33 @@ extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct k
+ int vfs_getattr_nosec(struct path *path, struct kstat *stat)
+ {
+ 	struct inode *inode = d_backing_inode(path->dentry);
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++	u32 result_mask = 0;
++	bool is_fuse = false;
+ 
+-	if (inode->i_op->getattr)
+-		return inode->i_op->getattr(path->mnt, path->dentry, stat);
++	if (susfs_is_current_app_uid() &&
++	    susfs_is_inode_sus_kstat(inode, &is_fuse))
++		result_mask = is_fuse ? STATX_SUS_KSTAT_FUSE :
++			STATX_SUS_KSTAT;
++#endif
++
++	if (inode->i_op->getattr) {
++		int err;
++
++		err = inode->i_op->getattr(path->mnt, path->dentry, stat);
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++		if (!err && result_mask)
++			susfs_sus_kstat_spoof_generic_fillattr(inode, stat,
++					result_mask);
++#endif
++		return err;
++	}
+ 
+ 	generic_fillattr(inode, stat);
++#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
++	if (result_mask)
++		susfs_sus_kstat_spoof_generic_fillattr(inode, stat, result_mask);
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/fs/statfs.c b/fs/statfs.c
+index a2dd028..b28b587 100644
+--- a/fs/statfs.c
++++ b/fs/statfs.c
+@@ -86,10 +86,10 @@ static int susfs_statfs_by_dentry(struct dentry *dentry, struct kstatfs *buf, bo
+ 	retval = security_sb_statfs(dentry);
+ 	if (retval)
+ 		return retval;
+-	if (susfs_sus_kstat_spoof_vfs_statfs(d_backing_inode(dentry), buf, is_fuse))
+-		goto orig_flow;
+-	retval = dentry->d_sb->s_op->statfs(dentry, buf);
+-orig_flow:
++	retval = susfs_sus_kstat_spoof_vfs_statfs(d_backing_inode(dentry), buf,
++						   is_fuse);
++	if (retval)
++		retval = dentry->d_sb->s_op->statfs(dentry, buf);
+ 	if (retval == 0 && buf->f_frsize == 0)
+ 		buf->f_frsize = buf->f_bsize;
+ 	return retval;
+diff --git a/fs/susfs.c b/fs/susfs.c
+index 211c9e9..054c1b2 100644
+--- a/fs/susfs.c
++++ b/fs/susfs.c
+@@ -500,6 +500,9 @@ void susfs_update_sus_kstat(void __user **user_info) {
+ 			new_entry->info.target_ino = info.target_ino;
+ 			new_entry->target_ino = info.target_ino;
+ 			new_entry->target_dev = tmp_entry->target_dev;
++			memcpy(&new_entry->spoofed_kstatfs, &tmp_entry->spoofed_kstatfs,
++			       sizeof(tmp_entry->spoofed_kstatfs));
++			new_entry->spoofed_mnt_id = tmp_entry->spoofed_mnt_id;
+ 			new_entry->is_fuse = tmp_entry->is_fuse;
+ 			info.err = susfs_mark_inode_sus_kstat(new_entry->info.target_pathname, new_entry, true);
+ 			if (info.err) {
+@@ -1242,8 +1245,11 @@ void susfs_get_enabled_features(void __user **user_info) {
+ 	size_t copied_size = 0;
+ 
+ 	if (!info) {
+-		info->err = -ENOMEM;
+-		goto out_copy_to_user;
++		int err = -ENOMEM;
++
++		copy_to_user(&((struct st_susfs_enabled_features __user *)*user_info)->err,
++				 &err, sizeof(err));
++		return;
+ 	}
+ 
+ 	if (copy_from_user(info, (struct st_susfs_enabled_features __user*)*user_info, sizeof(struct st_susfs_enabled_features))) {
+diff --git a/include/linux/susfs.h b/include/linux/susfs.h
+index 125ec8f..77e11b6 100644
+--- a/include/linux/susfs.h
++++ b/include/linux/susfs.h
+@@ -68,7 +68,7 @@ struct st_susfs_hide_sus_mnts_for_non_su_procs {
+ #define KSTAT_SPOOF_ATIME_TV_NSEC (1 << 5)
+ #define KSTAT_SPOOF_MTIME_TV_SEC (1 << 6)
+ #define KSTAT_SPOOF_MTIME_TV_NSEC (1 << 7)
+-#define KSTAT_SPOOF_CTIME_TV_SEC (1 < 8)
++#define KSTAT_SPOOF_CTIME_TV_SEC (1 << 8)
+ #define KSTAT_SPOOF_CTIME_TV_NSEC (1 << 9)
+ #define KSTAT_SPOOF_BLOCKS (1 << 10)
+ #define KSTAT_SPOOF_BLKSIZE (1 << 11)
+diff --git a/security/selinux/avc.c b/security/selinux/avc.c
+index 121fbf8..34fadf1 100644
+--- a/security/selinux/avc.c
++++ b/security/selinux/avc.c
+@@ -192,6 +192,20 @@ static void avc_dump_query(struct audit_buffer *ab, struct selinux_state *state,
+ 	}
+ 
+ 	rc = security_sid_to_context(state, tsid, &scontext, &scontext_len);
++#ifdef CONFIG_KSU_SUSFS
++	if (static_branch_likely(&susfs_is_avc_log_spoofing_enabled)) {
++		if (unlikely(tsid == susfs_ksu_sid)) {
++			if (rc) {
++				audit_log_format(ab, " tsid=%d", susfs_priv_app_sid);
++			} else {
++				audit_log_format(ab, " tcontext=%s",
++						 "u:r:priv_app:s0:c512,c768");
++				kfree(scontext);
++			}
++			goto bypass_orig_flow;
++		}
++	}
++#endif
+ 	if (rc)
+ 		audit_log_format(ab, " tsid=%d", tsid);
+ 	else {
