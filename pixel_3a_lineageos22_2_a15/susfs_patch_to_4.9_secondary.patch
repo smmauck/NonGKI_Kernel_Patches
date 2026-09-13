@@ -227,7 +227,7 @@ index b65c0ab..0c738b4 100644
  
  orig_flow:
 diff --git a/fs/statfs.c b/fs/statfs.c
-index eb2a7bd..b28b587 100644
+index 3ba543f..e555ba8 100644
 --- a/fs/statfs.c
 +++ b/fs/statfs.c
 @@ -86,10 +86,10 @@ static int susfs_statfs_by_dentry(struct dentry *dentry, struct kstatfs *buf, bo
