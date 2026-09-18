@@ -1,27 +1,3 @@
-diff --git a/fs/namei.c b/fs/namei.c
-index 5235abc..e2d289d 100644
---- a/fs/namei.c
-+++ b/fs/namei.c
-@@ -1623,6 +1623,9 @@ retry:
- 	dentry = lookup_real(base->d_inode, dentry, flags);
- 
- 	if (unlikely(dentry) && !IS_ERR(dentry) && dentry->d_inode && !found_sus_path && susfs_is_inode_sus_path(dentry->d_inode)) {
-+		bool deny_create = dentry->d_inode->i_sb->s_magic == FUSE_SUPER_MAGIC &&
-+			(flags & (LOOKUP_CREATE | LOOKUP_EXCL));
-+
- 		if (d_in_lookup(dentry))
- 			d_lookup_done(dentry);
- 		if (!(flags & LOOKUP_RCU))
-@@ -1631,8 +1634,7 @@ retry:
- 		//   it is trying to find the fuse sus path with the create flag, then
- 		//   at least we can prevent the fake qstr file from from being created,
- 		//   although it is futile to do this, it is better than doing nothing.
--		if (dentry->d_inode->i_sb->s_magic == FUSE_SUPER_MAGIC &&
--			(flags & (LOOKUP_CREATE | LOOKUP_EXCL)))
-+		if (deny_create)
- 			return ERR_PTR(-EACCES);
- 		dentry = d_alloc(base, &susfs_fake_qstr_name);
- 		found_sus_path = true;
 diff --git a/fs/notify/fdinfo.c b/fs/notify/fdinfo.c
 index 855ddae..be0db27 100644
 --- a/fs/notify/fdinfo.c
@@ -246,10 +222,10 @@ index 3ba543f..e555ba8 100644
  		buf->f_frsize = buf->f_bsize;
  	return retval;
 diff --git a/fs/susfs.c b/fs/susfs.c
-index f2f93ae..7e52a1a 100644
+index f879857..66371b3 100644
 --- a/fs/susfs.c
 +++ b/fs/susfs.c
-@@ -1242,8 +1242,11 @@ void susfs_get_enabled_features(void __user **user_info) {
+@@ -1249,8 +1249,11 @@ void susfs_get_enabled_features(void __user **user_info) {
  	size_t copied_size = 0;
  
  	if (!info) {
